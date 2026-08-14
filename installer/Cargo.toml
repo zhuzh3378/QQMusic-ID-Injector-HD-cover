@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 winreg = "0.55.0"
+payload = { path = "../payload" }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -9,10 +10,13 @@ use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 use windows::{
+    Foundation::Uri,
     Media::{
-        ISystemMediaTransportControlsDisplayUpdater_Vtbl, MusicDisplayProperties,
+        ISystemMediaTransportControlsDisplayUpdater_Vtbl,
+        MusicDisplayProperties,
         SystemMediaTransportControls,
     },
+    Storage::Streams::RandomAccessStreamReference,
     Win32::{
         Foundation::{E_FAIL, FALSE, HINSTANCE, HWND, LPARAM, MAX_PATH, TRUE},
         Graphics::Gdi::{BLENDFUNCTION, HDC},
@@ -40,6 +44,9 @@ use windows::{
 };
 
 static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
+thread_local! {
+    static IN_RECOMMIT: Cell<bool> = const { Cell::new(false) };
+}
 
 fn init_logging() {
     let temp_dir = std::env::temp_dir().join("QQMusicInjectorLogs");
@@ -198,6 +205,10 @@ struct AppState {
     song_struct_addr: AtomicUsize,
     original_update: AtomicPtr<c_void>,
     sys_funcs: OnceLock<SysFuncs>,
+
+    // 上一次写入 SMTC 的歌曲 ID。
+    // 避免每一次 Update() 都重新设置 Thumbnail。
+    last_song_id: AtomicUsize,
 }
 
 impl AppState {
@@ -206,6 +217,7 @@ impl AppState {
             song_struct_addr: AtomicUsize::new(0),
             original_update: AtomicPtr::new(std::ptr::null_mut()),
             sys_funcs: OnceLock::new(),
+            last_song_id: AtomicUsize::new(0),
         }
     }
 
@@ -421,9 +433,62 @@ unsafe extern "system" fn detour_update(this: *mut c_void) -> HRESULT {
         return E_FAIL;
     }
 
-    safe_call((), || {
-        let _ = (|| -> Result<()> {
-            let struct_addr = STATE.song_struct_addr.load(Ordering::Relaxed);
+    // ------------------------------------------------------------
+    // 防止“第二次提交”再次进入我们的修改逻辑。
+    //
+    // 第一次：
+    //   detour -> original(QQ Music)
+    //
+    // 第二次：
+    //   detour -> original(QQ Music)
+    //   ↑ IN_RECOMMIT=true，所以这里直接放行
+    // ------------------------------------------------------------
+    if IN_RECOMMIT.with(|flag| flag.get()) {
+        let original_ptr =
+            STATE.original_update.load(Ordering::Relaxed);
+
+        if original_ptr.is_null() {
+            return E_FAIL;
+        }
+
+        let original:
+            unsafe extern "system" fn(*mut c_void) -> HRESULT =
+            unsafe { std::mem::transmute(original_ptr) };
+
+        return unsafe { original(this) };
+    }
+
+    // ------------------------------------------------------------
+    // 1. 先调用 QQ Music 原始 Update()
+    //
+    // 让 QQ Music 先完成它自己的 SMTC 提交。
+    // ------------------------------------------------------------
+    let original_ptr =
+        STATE.original_update.load(Ordering::Relaxed);
+
+    if original_ptr.is_null() {
+        return E_FAIL;
+    }
+
+    let original:
+        unsafe extern "system" fn(*mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(original_ptr) };
+
+    let first_hr = unsafe { original(this) };
+
+    // 原始 Update() 失败的话，不继续覆盖。
+    if first_hr.is_err() {
+        return first_hr;
+    }
+
+    // ------------------------------------------------------------
+    // 2. 读取 QQ Music 当前歌曲信息
+    // ------------------------------------------------------------
+    let modify_result = safe_call(
+        Err(Error::from(E_FAIL)),
+        || {
+            let struct_addr =
+                STATE.song_struct_addr.load(Ordering::Relaxed);
 
             if struct_addr == 0 {
                 info!("内存特征码尚未定位，跳过本次 Update");
@@ -431,61 +496,121 @@ unsafe extern "system" fn detour_update(this: *mut c_void) -> HRESULT {
             }
 
             let read_result = try_seh(|| {
-                let song_info = unsafe { &*(struct_addr as *const CurrentSongInfo) };
+                let song_info =
+                    unsafe {
+                        &*(struct_addr as *const CurrentSongInfo)
+                    };
 
                 (
                     song_info.id,
                     song_info.name.to_string_lossy(),
-                    song_info.artist.to_string_lossy(),
-                    song_info.album.to_string_lossy(),
+                    song_info.album_thumbnail_url.to_string_lossy(),
                 )
             });
 
-            let (id, name, _artist, _album) = match read_result {
-                Ok(data) => data,
-                Err(code) => {
-                    error!("捕获到异常 (0x{code:X})，特征码可能已失效");
+            let (id, name, cover_url) =
+                match read_result {
+                    Ok(data) => data,
 
-                    STATE.song_struct_addr.store(0, Ordering::Relaxed);
+                    Err(code) => {
+                        error!(
+                            "捕获到异常 (0x{code:X})，特征码可能已失效"
+                        );
 
-                    return Ok(());
-                }
-            };
+                        STATE.song_struct_addr.store(
+                            0,
+                            Ordering::Relaxed,
+                        );
 
-            // 本地音乐的 ID 为 0
+                        return Ok(());
+                    }
+                };
+
+            // 本地音乐
             if id == 0 {
                 info!(
                     song.id = id,
                     song.name = %name,
-                    "ID 为 0, 跳过写入 (本地歌曲则为预期)"
+                    "ID 为 0, 跳过写入"
                 );
+
                 return Ok(());
             }
 
-            if let Some(props) = unsafe { get_music_properties_from_vtable(this) } {
+            // ----------------------------------------------------
+            // 3. 修改 Genre
+            // ----------------------------------------------------
+            if let Some(props) =
+                unsafe { get_music_properties_from_vtable(this) }
+            {
                 let genres = props.Genres()?;
+
                 genres.Clear()?;
 
-                let formatted_id = format!("QQ-{id}");
-                genres.Append(&HSTRING::from(&formatted_id))?;
+                let formatted_id =
+                    format!("QQ-{id}");
 
-                info!(song.id = %formatted_id, song.name = %name, "写入流派字段");
+                genres.Append(
+                    &HSTRING::from(&formatted_id)
+                )?;
+
+                info!(
+                    song.id = %formatted_id,
+                    song.name = %name,
+                    "写入流派字段"
+                );
             } else {
-                warn!("无法从 VTable 获取 MusicDisplayProperties");
+                warn!(
+                    "无法从 VTable 获取 MusicDisplayProperties"
+                );
             }
-            Ok(())
-        })();
-    });
 
-    safe_call(E_FAIL, || {
-        let original_ptr = STATE.original_update.load(Ordering::Relaxed);
-        if original_ptr.is_null() {
-            E_FAIL
-        } else {
-            let original: unsafe extern "system" fn(*mut c_void) -> HRESULT =
-                unsafe { std::mem::transmute(original_ptr) };
-            unsafe { original(this) }
-        }
+            // ----------------------------------------------------
+            // 4. 只有新歌曲才重新设置高清封面
+            // ----------------------------------------------------
+            let old_id =
+                STATE.last_song_id.swap(
+                    id as usize,
+                    Ordering::Relaxed,
+                );
+
+            if old_id != id as usize {
+                if let Err(e) = unsafe {
+                    set_hd_thumbnail(
+                        this,
+                        &cover_url,
+                    )
+                } {
+                    warn!(
+                        "设置高清封面失败: {e:?}"
+                    );
+                }
+            }
+
+            Ok(())
+        },
+    );
+
+    if let Err(e) = modify_result {
+        warn!("修改 SMTC 信息失败: {e:?}");
+    }
+
+    // ------------------------------------------------------------
+    // 5. 再提交一次
+    //
+    // 这里必须设置递归保护。
+    // 第二次 original(this) -> detour_update(this)
+    // 会走上面的 IN_RECOMMIT 分支，直接放行到 original。
+    // ------------------------------------------------------------
+    IN_RECOMMIT.with(|flag| {
+        flag.set(true);
+
+        let result =
+            unsafe { original(this) };
+
+        flag.set(false);
+
+        result
     })
 }
 
@@ -534,6 +659,84 @@ unsafe fn get_music_properties_from_vtable(this: *mut c_void) -> Option<MusicDis
             None
         }
     }
+}
+
+unsafe fn set_hd_thumbnail(
+    this: *mut c_void,
+    original_url: &str,
+) -> Result<()> {
+    if this.is_null() || original_url.is_empty() {
+        return Ok(());
+    }
+
+    let hd_url = match build_hd_cover_url(original_url) {
+        Some(url) => url,
+        None => {
+            warn!(
+                original_url = %original_url,
+                "无法从封面 URL 提取 Album MID"
+            );
+            return Ok(());
+        }
+    };
+
+    info!(
+        hd_url = %hd_url,
+        "设置 1500x1500 高清封面"
+    );
+
+    let uri =
+        Uri::CreateUri(
+            &HSTRING::from(&hd_url)
+        )?;
+
+    let stream_ref =
+        RandomAccessStreamReference::CreateFromUri(&uri)?;
+
+    let updater =
+        match windows::Media::
+            SystemMediaTransportControlsDisplayUpdater
+            ::from_raw_borrowed(&this)
+        {
+            Some(v) => v,
+            None => {
+                return Err(
+                    Error::from(E_FAIL)
+                );
+            }
+        };
+
+    updater.SetThumbnail(&stream_ref)?;
+
+    Ok(())
+}
+
+fn build_hd_cover_url(original_url: &str) -> Option<String> {
+    // 从：
+    // T002R500x500M0000009NU2K0oNnlt_2.jpg
+    //
+    // 提取：
+    // M0000009NU2K0oNnlt
+
+    let marker = "M000";
+
+    let start = original_url.find(marker)?;
+
+    let rest = &original_url[start..];
+
+    let end = rest.find(".jpg")?;
+
+    let mid_part = &rest[..end];
+
+    // 去掉可能存在的 _1 / _2
+    let mid = mid_part
+        .split('_')
+        .next()
+        .unwrap_or(mid_part);
+
+    Some(format!(
+        "https://y.qq.com/music/photo_new/T002R1500x1500{mid}.jpg?max_age=2592000"
+    ))
 }
 
 unsafe fn scan_for_address() {

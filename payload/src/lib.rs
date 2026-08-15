@@ -1,19 +1,15 @@
-use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use std::{panic, thread};
-
 use minhook::MinHook;
 use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-
 use windows::{
     Foundation::Uri,
     Media::{
-        ISystemMediaTransportControlsDisplayUpdater_Vtbl,
-        MusicDisplayProperties,
+        ISystemMediaTransportControlsDisplayUpdater_Vtbl, MusicDisplayProperties,
         SystemMediaTransportControls,
     },
     Storage::Streams::RandomAccessStreamReference,
@@ -44,13 +40,9 @@ use windows::{
 };
 
 static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
-thread_local! {
-    static IN_RECOMMIT: Cell<bool> = const { Cell::new(false) };
-}
 
 fn init_logging() {
     let temp_dir = std::env::temp_dir().join("QQMusicInjectorLogs");
-
     let file_appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix("payload")
@@ -58,16 +50,13 @@ fn init_logging() {
         .max_log_files(7)
         .build(temp_dir)
         .expect("初始化日志失败");
-
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_file(true)
         .with_line_number(true)
         .init();
-
     let _ = LOG_GUARD.set(guard);
 }
 
@@ -86,7 +75,6 @@ where
                 |s| *s,
             );
             error!("一个 FFI 调用发生了 Panic: {message}");
-
             fallback
         }
     }
@@ -94,27 +82,27 @@ where
 
 // https://github.com/Kxnrl/NetEase-Cloud-Music-DiscordRPC/blob/d3b77c679379aff1294cc83a285ad4f695376ad6/Vanessa/Players/Tencent.cs
 /*
-    版本 20.43 ~ 21.93 结构
-    struct CurrentSongInfo {
-        std::string m_szSong;              // 0x0
-        std::string m_szArtist;            // 0x18
-        std::string m_szAlbum;             // 0x30
-        std::string m_szAlbumThumbnailUrl; // 0x48
-        uint32_t m_nSongId;                // 0x60
-        private: char pad_64[0x4]; public:
-        uint32_t m_nSongDuration;          // 0x68
-        uint32_t m_nSongProgress;          // 0x6c
-        uint32_t m_nPlayStatus;            // 0x70
-    }; // Size: 0x74
+版本 20.43 ~ 21.93 结构
+struct CurrentSongInfo {
+    std::string m_szSong;              // 0x0
+    std::string m_szArtist;            // 0x18
+    std::string m_szAlbum;             // 0x30
+    std::string m_szAlbumThumbnailUrl; // 0x48
+    uint32_t m_nSongId;                // 0x60
+private: char pad_64[0x4]; public:
+    uint32_t m_nSongDuration;          // 0x68
+    uint32_t m_nSongProgress;          // 0x6c
+    uint32_t m_nPlayStatus;            // 0x70
+}; // Size: 0x74
 */
 
 // 如何更新Pattern:
 // 1. 在 QQMusic.dll 里搜字符串 "Tencent Technology (Shenzhen) Company Limited", 并且找到引用的函数（理论上只有一个引用）
 // 2. 引用到字符串的是一个初始化的函数，在引用到字符串的地方往上找类似这样的伪代码，理论上来讲这个伪代码会重复3次
-// byte_xxxxx = 0;
-// dword_xxxxx+0x10 = 0;
-// dword_xxxxx+0x14 = 15;
-// 这个是初始化 std::string, 我们要找的是第一个，这个是当前播放的歌的名字
+//    byte_xxxxx = 0;
+//    dword_xxxxx+0x10 = 0;
+//    dword_xxxxx+0x14 = 15;
+//    这个是初始化 std::string, 我们要找的是第一个，这个是当前播放的歌的名字
 // 3. 选中然后在汇编页面生成Pattern
 const PATTERN: &str =
     "A2 ?? ?? ?? ?? A3 ?? ?? ?? ?? C7 05 ?? ?? ?? ?? ?? ?? ?? ?? A2 ?? ?? ?? ?? A3";
@@ -182,14 +170,11 @@ const _: () = {
 unsafe fn is_target_process() -> bool {
     let mut filename = [0u16; MAX_PATH as usize];
     let len = unsafe { GetModuleFileNameW(None, &mut filename) };
-
     if len == 0 {
         return false;
     }
-
     let full_path = String::from_utf16_lossy(&filename[..len as usize]);
     let path = std::path::Path::new(&full_path);
-
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.eq_ignore_ascii_case("QQMusic.exe"))
@@ -205,7 +190,6 @@ struct AppState {
     song_struct_addr: AtomicUsize,
     original_update: AtomicPtr<c_void>,
     sys_funcs: OnceLock<SysFuncs>,
-
     // 上一次写入 SMTC 的歌曲 ID。
     // 避免每一次 Update() 都重新设置 Thumbnail。
     last_song_id: AtomicUsize,
@@ -242,12 +226,10 @@ unsafe fn init_sys_funcs() -> SysFuncs {
         };
     }
     let sys_dir = String::from_utf16_lossy(&sys_dir_buf[..len]);
-
     let source_path = format!("{sys_dir}\\msimg32.dll");
 
     let pid = unsafe { GetCurrentProcessId() };
     let temp_dir = std::env::temp_dir();
-
     if let Ok(entries) = std::fs::read_dir(&temp_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -268,10 +250,8 @@ unsafe fn init_sys_funcs() -> SysFuncs {
 
     let dest_path_buf = temp_dir.join(format!("_msimg32_qq_{pid}.dll"));
     let dest_path = dest_path_buf.to_string_lossy().to_string();
-
     let source_h = HSTRING::from(&source_path);
     let dest_h = HSTRING::from(&dest_path);
-
     if let Err(e) = unsafe { CopyFileW(&source_h, &dest_h, false) } {
         error!("复制系统 msimg32 失败: {e:?}");
     }
@@ -287,7 +267,6 @@ unsafe fn init_sys_funcs() -> SysFuncs {
             };
         }
     };
-
     info!(path = %dest_path, "正在加载代理 DLL");
 
     let get_func = |name: &str| -> Option<usize> {
@@ -295,6 +274,7 @@ unsafe fn init_sys_funcs() -> SysFuncs {
         let addr = unsafe { GetProcAddress(lib, PCSTR(name_h.as_ptr().cast::<u8>())) };
         addr.map(|f| f as usize)
     };
+
     unsafe {
         SysFuncs {
             alpha_blend: get_func("AlphaBlend").map(|f| std::mem::transmute(f)),
@@ -361,25 +341,19 @@ unsafe fn find_main_window() -> HWND {
     let current_pid = unsafe { GetCurrentProcessId() };
     let start_time = Instant::now();
     let timeout = Duration::from_secs(15);
-
     info!(pid = current_pid, "开始查找主窗口");
-
     loop {
         let mut found_hwnd = HWND(std::ptr::null_mut());
-
         let _ =
             unsafe { EnumWindows(Some(enum_window_proc), LPARAM(&raw mut found_hwnd as isize)) };
-
         if !found_hwnd.0.is_null() {
             info!(hwnd = ?found_hwnd, "找到主窗口句柄");
             return found_hwnd;
         }
-
         if start_time.elapsed() > timeout {
             warn!("查找主窗口超时，初始化可能会失败");
             return HWND(std::ptr::null_mut());
         }
-
         thread::sleep(Duration::from_millis(500));
     }
 }
@@ -389,11 +363,10 @@ unsafe fn install_hook() -> Result<()> {
         factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
     let hwnd = unsafe { find_main_window() };
     let smtc: SystemMediaTransportControls = unsafe { interop.GetForWindow(hwnd) }?;
-
     let updater = smtc.DisplayUpdater()?;
+
     let updater_raw: IInspectable = updater.cast()?;
     let raw_ptr = updater_raw.as_raw();
-
     if raw_ptr.is_null() {
         error!("DisplayUpdater 原始指针为空");
         return Err(Error::from(E_FAIL));
@@ -401,14 +374,12 @@ unsafe fn install_hook() -> Result<()> {
 
     let vtable_ptr =
         unsafe { *raw_ptr.cast::<*const ISystemMediaTransportControlsDisplayUpdater_Vtbl>() };
-
     if vtable_ptr.is_null() {
         error!("DisplayUpdater VTable 指针为空");
         return Err(Error::from(E_FAIL));
     }
 
     let update_method_addr = unsafe { (*vtable_ptr).Update } as *mut c_void;
-
     info!(addr = ?update_method_addr, "获取到 Update 方法地址");
 
     let target = update_method_addr;
@@ -433,185 +404,90 @@ unsafe extern "system" fn detour_update(this: *mut c_void) -> HRESULT {
         return E_FAIL;
     }
 
-    // ------------------------------------------------------------
-    // 防止“第二次提交”再次进入我们的修改逻辑。
-    //
-    // 第一次：
-    //   detour -> original(QQ Music)
-    //
-    // 第二次：
-    //   detour -> original(QQ Music)
-    //   ↑ IN_RECOMMIT=true，所以这里直接放行
-    // ------------------------------------------------------------
-    if IN_RECOMMIT.with(|flag| flag.get()) {
-        let original_ptr =
-            STATE.original_update.load(Ordering::Relaxed);
-
-        if original_ptr.is_null() {
-            return E_FAIL;
-        }
-
-        let original:
-            unsafe extern "system" fn(*mut c_void) -> HRESULT =
-            unsafe { std::mem::transmute(original_ptr) };
-
-        return unsafe { original(this) };
-    }
-
-    // ------------------------------------------------------------
-    // 1. 先调用 QQ Music 原始 Update()
-    //
-    // 让 QQ Music 先完成它自己的 SMTC 提交。
-    // ------------------------------------------------------------
-    let original_ptr =
-        STATE.original_update.load(Ordering::Relaxed);
-
+    let original_ptr = STATE.original_update.load(Ordering::Relaxed);
     if original_ptr.is_null() {
         return E_FAIL;
     }
-
-    let original:
-        unsafe extern "system" fn(*mut c_void) -> HRESULT =
+    let original: unsafe extern "system" fn(*mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(original_ptr) };
 
-    let first_hr = unsafe { original(this) };
-
-    // 原始 Update() 失败的话，不继续覆盖。
-    if first_hr.is_err() {
-        return first_hr;
-    }
-
     // ------------------------------------------------------------
-    // 2. 读取 QQ Music 当前歌曲信息
+    // 1. 在 QQ Music 提交之前，先修改好我们需要的数据
     // ------------------------------------------------------------
-    let modify_result = safe_call(
-        Err(Error::from(E_FAIL)),
-        || {
-            let struct_addr =
-                STATE.song_struct_addr.load(Ordering::Relaxed);
+    let modify_result = safe_call(Err(Error::from(E_FAIL)), || {
+        let struct_addr = STATE.song_struct_addr.load(Ordering::Relaxed);
+        if struct_addr == 0 {
+            return Ok(());
+        }
 
-            if struct_addr == 0 {
-                info!("内存特征码尚未定位，跳过本次 Update");
+        // 分离读取逻辑：防止切歌瞬间字符串失效导致整个 try_seh 崩溃
+        let id = match try_seh(|| unsafe { (*(struct_addr as *const CurrentSongInfo)).id }) {
+            Ok(id) => id,
+            Err(code) => {
+                error!("读取 song.id 失败 (0x{code:X})，特征码可能已失效");
+                STATE.song_struct_addr.store(0, Ordering::Relaxed);
                 return Ok(());
             }
+        };
 
-            let read_result = try_seh(|| {
-                let song_info =
-                    unsafe {
-                        &*(struct_addr as *const CurrentSongInfo)
-                    };
+        let name = try_seh(|| unsafe {
+            (*(struct_addr as *const CurrentSongInfo)).name.to_string_lossy()
+        })
+        .unwrap_or_default();
 
-                (
-                    song_info.id,
-                    song_info.name.to_string_lossy(),
-                    song_info.album_thumbnail_url.to_string_lossy(),
-                )
-            });
+        let cover_url = try_seh(|| unsafe {
+            (*(struct_addr as *const CurrentSongInfo))
+                .album_thumbnail_url
+                .to_string_lossy()
+        })
+        .unwrap_or_default();
 
-            let (id, name, cover_url) =
-                match read_result {
-                    Ok(data) => data,
+        // 本地音乐或未知状态
+        if id == 0 {
+            return Ok(());
+        }
 
-                    Err(code) => {
-                        error!(
-                            "捕获到异常 (0x{code:X})，特征码可能已失效"
-                        );
-
-                        STATE.song_struct_addr.store(
-                            0,
-                            Ordering::Relaxed,
-                        );
-
-                        return Ok(());
-                    }
-                };
-
-            // 本地音乐
-            if id == 0 {
-                info!(
-                    song.id = id,
-                    song.name = %name,
-                    "ID 为 0, 跳过写入"
-                );
-
-                return Ok(());
-            }
-
-            // ----------------------------------------------------
-            // 3. 修改 Genre
-            // ----------------------------------------------------
-            if let Some(props) =
-                unsafe { get_music_properties_from_vtable(this) }
-            {
-                let genres = props.Genres()?;
-
-                genres.Clear()?;
-
-                let formatted_id =
-                    format!("QQ-{id}");
-
-                genres.Append(
-                    &HSTRING::from(&formatted_id)
-                )?;
-
+        // ----------------------------------------------------
+        // 2. 修改 Genre
+        // ----------------------------------------------------
+        if let Some(props) = unsafe { get_music_properties_from_vtable(this) } {
+            if let Ok(genres) = props.Genres() {
+                let _ = genres.Clear();
+                let formatted_id = format!("QQ-{id}");
+                let _ = genres.Append(&HSTRING::from(&formatted_id));
                 info!(
                     song.id = %formatted_id,
                     song.name = %name,
                     "写入流派字段"
                 );
-            } else {
-                warn!(
-                    "无法从 VTable 获取 MusicDisplayProperties"
-                );
             }
+        } else {
+            warn!("无法从 VTable 获取 MusicDisplayProperties");
+        }
 
-            // ----------------------------------------------------
-            // 4. 只有新歌曲才重新设置高清封面
-            // ----------------------------------------------------
-            let old_id =
-                STATE.last_song_id.swap(
-                    id as usize,
-                    Ordering::Relaxed,
-                );
-
-            if old_id != id as usize {
-                if let Err(e) = unsafe {
-                    set_hd_thumbnail(
-                        this,
-                        &cover_url,
-                    )
-                } {
-                    warn!(
-                        "设置高清封面失败: {e:?}"
-                    );
-                }
+        // ----------------------------------------------------
+        // 3. 只有新歌曲才重新设置高清封面
+        // ----------------------------------------------------
+        let old_id = STATE.last_song_id.swap(id as usize, Ordering::Relaxed);
+        if old_id != id as usize {
+            if let Err(e) = unsafe { set_hd_thumbnail(this, &cover_url) } {
+                warn!("设置高清封面失败: {e:?}");
             }
+        }
 
-            Ok(())
-        },
-    );
+        Ok(())
+    });
 
     if let Err(e) = modify_result {
         warn!("修改 SMTC 信息失败: {e:?}");
     }
 
     // ------------------------------------------------------------
-    // 5. 再提交一次
-    //
-    // 这里必须设置递归保护。
-    // 第二次 original(this) -> detour_update(this)
-    // 会走上面的 IN_RECOMMIT 分支，直接放行到 original。
+    // 4. 调用 QQ Music 原始 Update() 
+    // 此时我们的修改已经生效，QQ Music 会把我们的修改一起提交给系统
+    // 只需要调用一次！完美避开 Windows 的节流机制
     // ------------------------------------------------------------
-    IN_RECOMMIT.with(|flag| {
-        flag.set(true);
-
-        let result =
-            unsafe { original(this) };
-
-        flag.set(false);
-
-        result
-    })
+    unsafe { original(this) }
 }
 
 unsafe fn get_music_properties_from_vtable(this: *mut c_void) -> Option<MusicDisplayProperties> {
@@ -623,16 +499,13 @@ unsafe fn get_music_properties_from_vtable(this: *mut c_void) -> Option<MusicDis
     let seh_result = try_seh(|| {
         let vtable_ptr_ptr = this.cast::<*const ISystemMediaTransportControlsDisplayUpdater_Vtbl>();
         let vtable_ptr = unsafe { *vtable_ptr_ptr };
-
         if vtable_ptr.is_null() {
             error!("Update 对象 VTable 指针为空");
             return Err(E_FAIL);
         }
 
         let mut result_ptr: *mut c_void = std::ptr::null_mut();
-
         let hr = unsafe { ((*vtable_ptr).MusicProperties)(this, &raw mut result_ptr) };
-
         Ok((hr, result_ptr))
     });
 
@@ -685,29 +558,19 @@ unsafe fn set_hd_thumbnail(
         "设置 1500x1500 高清封面"
     );
 
-    let uri =
-        Uri::CreateUri(
-            &HSTRING::from(&hd_url)
-        )?;
-
-    let stream_ref =
-        RandomAccessStreamReference::CreateFromUri(&uri)?;
+    let uri = Uri::CreateUri(&HSTRING::from(&hd_url))?;
+    let stream_ref = RandomAccessStreamReference::CreateFromUri(&uri)?;
 
     let updater =
-        match windows::Media::
-            SystemMediaTransportControlsDisplayUpdater
-            ::from_raw_borrowed(&this)
+        match windows::Media::SystemMediaTransportControlsDisplayUpdater::from_raw_borrowed(&this)
         {
             Some(v) => v,
             None => {
-                return Err(
-                    Error::from(E_FAIL)
-                );
+                return Err(Error::from(E_FAIL));
             }
         };
 
     updater.SetThumbnail(&stream_ref)?;
-
     Ok(())
 }
 
@@ -717,15 +580,10 @@ fn build_hd_cover_url(original_url: &str) -> Option<String> {
     //
     // 提取：
     // M0000009NU2K0oNnlt
-
     let marker = "M000";
-
     let start = original_url.find(marker)?;
-
     let rest = &original_url[start..];
-
     let end = rest.find(".jpg")?;
-
     let mid_part = &rest[..end];
 
     // 去掉可能存在的 _1 / _2
@@ -750,10 +608,9 @@ unsafe fn scan_for_address() {
         );
 
         let scan_limit = base_addr + 20 * 1024 * 1024;
-
         info!("开始扫描内存特征码...");
-        let pattern_bytes = parse_pattern(PATTERN);
 
+        let pattern_bytes = parse_pattern(PATTERN);
         let start_time = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(60);
 
@@ -775,17 +632,14 @@ unsafe fn scan_for_address() {
                         std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
                     )
                 };
-
                 if query_size == 0 {
                     break;
                 }
 
                 let next_addr = current_addr + mbi.RegionSize;
-
                 let is_committed = mbi.State == MEM_COMMIT;
                 let protect = mbi.Protect.0;
                 let is_guard = (protect & PAGE_GUARD.0) != 0;
-
                 let base_protect = protect & 0xFF;
                 let is_readable = base_protect == PAGE_READONLY.0
                     || base_protect == PAGE_READWRITE.0
@@ -795,12 +649,10 @@ unsafe fn scan_for_address() {
                 if is_committed && !is_guard && is_readable {
                     let safe_end = next_addr.min(scan_limit);
                     let safe_len = safe_end.saturating_sub(current_addr);
-
                     if safe_len > 0 {
                         let slice = unsafe {
                             std::slice::from_raw_parts(current_addr as *const u8, safe_len)
                         };
-
                         if let Some(offset) = find_pattern_bytes(slice, &pattern_bytes) {
                             let pattern_addr = current_addr + offset;
                             let ptr_addr = (pattern_addr + 1) as *const u32;
@@ -814,21 +666,18 @@ unsafe fn scan_for_address() {
                                 struct_addr = format_args!("0x{struct_addr:X}"),
                                 "特征码定位成功"
                             );
-
                             STATE.song_struct_addr.store(struct_addr, Ordering::Relaxed);
                             found = true;
                             break;
                         }
                     }
                 }
-
                 current_addr = next_addr;
             }
 
             if found {
                 break;
             }
-
             thread::sleep(std::time::Duration::from_millis(1000));
         }
     } else {
@@ -866,8 +715,8 @@ unsafe fn log_host_version() {
         warn!("无法获取当前进程文件名");
         return;
     }
-
     let path = windows::core::PCWSTR(filename.as_ptr());
+
     let size = unsafe { GetFileVersionInfoSizeW(path, None) };
     if size == 0 {
         warn!("无法获取文件版本信息大小");
@@ -875,16 +724,13 @@ unsafe fn log_host_version() {
     }
 
     let mut data = vec![0u8; size as usize];
-
     if unsafe { GetFileVersionInfoW(path, Some(0), size, data.as_mut_ptr().cast()) }.is_ok() {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let mut len: u32 = 0;
-
         if unsafe { VerQueryValueW(data.as_ptr().cast(), w!("\\"), &raw mut ptr, &raw mut len) }
             .as_bool()
         {
             let info = unsafe { &*(ptr as *const VS_FIXEDFILEINFO) };
-
             let v1 = (info.dwFileVersionMS >> 16) & 0xFFFF;
             let v2 = info.dwFileVersionMS & 0xFFFF;
             let v3 = (info.dwFileVersionLS >> 16) & 0xFFFF;
@@ -933,7 +779,6 @@ where
     let wrapper = || {
         result = Some(func());
     };
-
     unsafe { run_seh_impl(wrapper).map(|()| result.unwrap()) }
 }
 
